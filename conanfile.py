@@ -5,6 +5,7 @@ class TP_Endpoint_POC( ConanFile ):
     generators = "pkg_config"
     requires = (
         "boost/1.75.0",
+        "cpr/1.5.0"
     )
 
     build_requires = ( 

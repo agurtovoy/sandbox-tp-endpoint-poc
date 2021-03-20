@@ -2,6 +2,11 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/asio/strand.hpp>
+
+#include <boost/iostreams/filtering_streambuf.hpp>
+#include <boost/iostreams/filter/gzip.hpp>
+#include <boost/iostreams/copy.hpp>
+
 #include <boost/json/src.hpp>
 
 #include <cstdlib>
@@ -34,7 +39,7 @@ fail(beast::error_code ec, char const* what)
 class http_session : public std::enable_shared_from_this<http_session>
 {
     using self_t = http_session;
-    using put_callback_t = std::function<void (http::response<http::string_body>&)>;
+    using put_callback_t = std::function<void (http::request<http::string_body> const&, http::response<http::string_body>&)>;
 
     tcp::resolver resolver_;
     beast::tcp_stream stream_;
@@ -59,6 +64,7 @@ public:
     put(
         url_t const& url,
         json::array const& input,
+        bool accept_gzip,
         put_callback_t const& callback
         )
     {
@@ -67,6 +73,8 @@ public:
         req_.target(path(url));
         req_.set(http::field::host, host(url));
         req_.set(http::field::content_type, "application/json");
+        if (accept_gzip)
+            req_.set(http::field::accept_encoding, "gzip");
         req_.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
         req_.body() = serialize(input);
         req_.prepare_payload();
@@ -141,7 +149,7 @@ public:
             return fail(ec, "read");
 
         if (callback_)
-            callback_(res_);
+            callback_(req_, res_);
 
         // Gracefully close the socket
         stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
@@ -190,13 +198,50 @@ void validate_result(json::array const& result)
 }
 
 
+namespace gzip {
+std::string compress(const std::string& data)
+{
+    namespace bio = boost::iostreams;
+
+    std::stringstream compressed;
+    std::stringstream origin(data);
+
+    bio::filtering_streambuf<bio::input> out;
+    out.push(bio::gzip_compressor(bio::gzip_params(bio::gzip::best_compression)));
+    out.push(origin);
+    bio::copy(out, compressed);
+
+    return compressed.str();
+}
+
+std::string decompress(const std::string& data)
+{
+    namespace bio = boost::iostreams;
+
+    std::stringstream compressed(data);
+    std::stringstream decompressed;
+
+    bio::filtering_streambuf<bio::input> out;
+    out.push(bio::gzip_decompressor());
+    out.push(compressed);
+    bio::copy(out, decompressed);
+
+    return decompressed.str();
+}
+} // namespace gzip {
+
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::cerr << "Usage: tp-endpoint-poc <hostname>\n";
+        std::cerr << "Usage: tp-endpoint-poc <hostname> [--gzip]\n";
         return EXIT_FAILURE;
     }
 
+    auto gzip_enabled = argc >= 3 && std::string(argv[2]) == "--gzip";
+    if (gzip_enabled)
+        std::cout << ">> gzip support enabled\n";
+        
     auto const model_endpoint_url = url_t(argv[1], "8000", "/tpfinalpositiongan/v1");
 
     try {
@@ -211,13 +256,22 @@ int main(int argc, char** argv)
         input.emplace_back(image2);
 
         // Launch the asynchronous operation
-        std::make_shared<http_session>(ioc)->put(model_endpoint_url, input, [](auto& res) {
-            auto const status = res.result();
-            if (status != http::status::ok)
-                throw std::runtime_error("HTTP/" + std::to_string(static_cast<unsigned>(status)) + ": " + res.body());
+        std::make_shared<http_session>(ioc)->put(model_endpoint_url, input, gzip_enabled, [](auto const& req, auto& res) {
+            std::cout << ">> request headers:\n" << req.base() << std::endl;
 
-            validate_result(json::parse(res.body()).as_array());
-            std::cout << "Success!\n";
+            auto const status = res.result();
+            auto const raw_body = res.body();
+            if (status != http::status::ok)
+                throw std::runtime_error("HTTP/" + std::to_string(static_cast<unsigned>(status)) + ": " + raw_body);
+
+            std::cout << ">> response headers:\n" << res.base() << std::endl;
+            std::cout << ">> response raw body:\n" << raw_body.substr(0, 1000) << "..." << std::endl;
+
+            auto body = res[http::field::content_encoding] == "gzip" ? gzip::decompress(raw_body) : raw_body;
+            std::cout << ">> response body:\n" << body.substr(0, 1000) << "..." << std::endl;
+
+            validate_result(json::parse(body).as_array());
+            std::cout << ">> success!\n";
         });
 
         // Run the I/O service. The call will return when
